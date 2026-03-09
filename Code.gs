@@ -6,7 +6,6 @@
  */
 
 const SCRIPT_CONFIG = {
-  TARGET_MAILBOX_EMAIL: "me",
   GMAIL_SEARCH_QUERY: "label:Name",
   DRIVE_FOLDER_ID: "",
   SPREADSHEET_ID: "",
@@ -14,121 +13,132 @@ const SCRIPT_CONFIG = {
   FILE_PREFIX: "PE_",
 };
 
-const PDF_MIME_TYPE = "application/pdf";
-
 function processEmailsAndSavePdfs() {
-  Logger.log("=== Skript gestartet ===");
+  const lock = LockService.getScriptLock();
+  try {
+    // Wait for up to 30 seconds for other executions to finish
+    lock.waitLock(30000);
+  } catch (e) { 
+    Logger.log("Could not obtain lock: " + e);
+    return; 
+  }
 
   try {
     const folder = DriveApp.getFolderById(SCRIPT_CONFIG.DRIVE_FOLDER_ID);
-    Logger.log(`Drive-Ordner gefunden: ${folder.getName()}`);
+    // Force open by ID every time to refresh the connection
+    const ss = SpreadsheetApp.openById(SCRIPT_CONFIG.SPREADSHEET_ID);
+    const sheet = getOrCreateSheet(ss, SCRIPT_CONFIG.SHEET_NAME);
 
-    const sheet = getOrCreateSpreadsheet(SCRIPT_CONFIG.SPREADSHEET_ID, SCRIPT_CONFIG.SHEET_NAME);
-    let nextId = getNextIterativeId(sheet, SCRIPT_CONFIG.FILE_PREFIX.length);
-    Logger.log(`Nächste fortlaufende ID: ${nextId}`);
+    const processedKeys = getProcessedKeysFromSheet(sheet);
+    let nextId = getNextIterativeId(sheet);
 
-    const threads = GmailApp.search(SCRIPT_CONFIG.GMAIL_SEARCH_QUERY, 0, 100);
-    Logger.log(`Gefundene Threads: ${threads.length}`);
+    // Limit threads to prevent "Server Error" timeouts
+    const threads = GmailApp.search(SCRIPT_CONFIG.GMAIL_SEARCH_QUERY, 0, 10).reverse();
+    const labelName = SCRIPT_CONFIG.GMAIL_SEARCH_QUERY.replace("label:", "");
+    const label = GmailApp.getUserLabelByName(labelName);
 
-    const logData = [];
+    if (threads.length === 0) return;
 
     threads.forEach((thread) => {
+      const threadId = thread.getId().trim();
       const messages = thread.getMessages();
+      let threadLogData = [];
 
       messages.forEach((msg) => {
-        const attachments = msg.getAttachments();
+        msg.getAttachments().forEach((att) => {
+          // Safety: ensure it's a PDF
+          if (att.getContentType() !== "application/pdf") return;
 
-        attachments.forEach((att) => {
-          if (att.getContentType() === PDF_MIME_TYPE) {
+          const rawFileName = att.getName().trim();
+          const bytes = att.getBytes();
+
+          // MD5 Hash calculation
+          const attHash = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, bytes)
+            .map(b => (b < 0 ? b + 256 : b).toString(16).padStart(2, "0"))
+            .join("");
+
+          const combinedKey = attHash + "||" + threadId;
+          if (processedKeys.has(combinedKey)) {
+            Logger.log("Skipping duplicate: " + rawFileName);
+            return;
+          }
+
+          try {
             const iterativeId = nextId.toString().padStart(3, "0");
-            const newFileName = `${SCRIPT_CONFIG.FILE_PREFIX}${iterativeId}_${att.getName()}`;
+            const newFileName = `${SCRIPT_CONFIG.FILE_PREFIX}${iterativeId}_${rawFileName}`;
+            const savedFile = folder.createFile(att.copyBlob()).setName(newFileName);
 
-            try {
-              const savedFile = folder.createFile(att.copyBlob()).setName(newFileName);
-              Logger.log(`PDF gespeichert: ${newFileName}`);
+            threadLogData.push([
+              iterativeId,        // A
+              newFileName,        // B
+              msg.getDate(),      // C
+              msg.getSubject(),   // D
+              msg.getFrom(),      // E
+              savedFile.getUrl(), // F
+              attHash,            // G
+              threadId            // H
+            ]);
 
-              logData.push([
-                iterativeId,
-                newFileName,
-                msg.getDate(),
-                msg.getSubject(),
-                msg.getFrom(),
-                savedFile.getUrl()
-              ]);
-
-              nextId++;
-            } catch (e) {
-              Logger.log(`Fehler beim Speichern der PDF '${att.getName()}': ${e}`);
-            }
+            processedKeys.add(combinedKey);
+            nextId++;
+          } catch (err) {
+            Logger.log("File save error: " + err);
           }
         });
       });
 
-      // Label entfernen
-      const labelName = SCRIPT_CONFIG.GMAIL_SEARCH_QUERY.replace("label:", "");
-      const label = GmailApp.getUserLabelByName(labelName);
+      if (threadLogData.length > 0) {
+        appendLogData(sheet, threadLogData);
+      }
+
+      // Remove label only after successful processing
       if (label) thread.removeLabel(label);
     });
 
-    if (logData.length > 0) {
-      appendLogData(sheet, logData);
-      Logger.log(`Protokolliert: ${logData.length} Zeilen`);
-    } else {
-      Logger.log("Keine PDFs gespeichert.");
-    }
-
-    PropertiesService.getScriptProperties().setProperty("nextId", nextId.toString());
-    Logger.log("=== Skript beendet ===");
-
-  } catch (err) {
-    Logger.log(`!!! Skriptfehler: ${err}`);
+  } catch (globalError) {
+    Logger.log("Global Error: " + globalError.message);
+  } finally {
+    // Crucial: Always flush and release
+    SpreadsheetApp.flush();
+    lock.releaseLock();
   }
 }
 
 /**
- * Spreadsheet holen oder erstellen
+ * Robust Sheet Getter
  */
-function getOrCreateSpreadsheet(spreadsheetId, sheetName) {
-  const ss = SpreadsheetApp.openById(spreadsheetId);
+function getOrCreateSheet(ss, sheetName) {
   let sheet = ss.getSheetByName(sheetName);
   if (!sheet) {
     sheet = ss.insertSheet(sheetName);
-    Logger.log(`Sheet '${sheetName}' erstellt`);
-  }
-  if (sheet.getLastRow() === 0) {
-    sheet.appendRow(["ID","Datei-Name","Datum","Betreff","Absender","Drive Link"]);
-    sheet.getRange("A1:F1").setFontWeight("bold");
+    sheet.appendRow(["ID", "Datei-Name", "Datum", "Betreff", "Absender", "Drive Link", "Att-Hash", "Thread-ID"]);
+    SpreadsheetApp.flush(); // Force creation before continuing
   }
   return sheet;
 }
 
-/**
- * Nächste ID ermitteln
- */
-function getNextIterativeId(sheet, prefixLength) {
-  const props = PropertiesService.getScriptProperties();
-  let nextId = props.getProperty("nextId");
-  if (nextId) return parseInt(nextId);
+function getProcessedKeysFromSheet(sheet) {
+  const keys = new Set();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return keys;
 
-  if (sheet.getLastRow() > 1) {
-    const fileNames = sheet.getRange(2, 2, sheet.getLastRow() - 1, 1).getValues().flat(); // Spalte 2: Datei-Name
-    const lastId = fileNames.reduce((maxId, name) => {
-      const idEndIndex = name.indexOf("_", prefixLength);
-      if (idEndIndex > prefixLength) {
-        const idStr = name.substring(prefixLength, idEndIndex);
-        const curr = parseInt(idStr, 10);
-        return Math.max(maxId, isNaN(curr) ? 0 : curr);
-      }
-      return maxId;
-    }, 0);
-    return lastId + 1;
+  const data = sheet.getRange(2, 7, lastRow - 1, 2).getValues();
+  data.forEach(row => {
+    if (row[0] && row[1]) keys.add(row[0].toString().trim() + "||" + row[1].toString().trim());
+  });
+  return keys;
+}
+
+function getNextIterativeId(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    const lastId = sheet.getRange(lastRow, 1).getValue();
+    if (!isNaN(lastId) && lastId !== "") return parseInt(lastId, 10) + 1;
   }
   return 1;
 }
 
-/**
- * Daten ins Sheet anhängen
- */
 function appendLogData(sheet, data) {
+  // Use a fresh reference to the sheet to prevent "Sheet not found" errors
   sheet.getRange(sheet.getLastRow() + 1, 1, data.length, data[0].length).setValues(data);
 }
